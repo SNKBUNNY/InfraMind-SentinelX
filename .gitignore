@@ -1,0 +1,39 @@
+# dependencies
+node_modules
+
+# next.js
+.next/
+out/
+build
+
+# database
+db/*.db
+db/*.db-journal
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+*.log
+dev.log
+server.log
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# env files - KEEP .env.example but ignore .env
+.env
+.env.local
+.env.production
+
+# vercel
+.vercel
+
+# skills
+/skills/
+.claude
+.z-ai-config

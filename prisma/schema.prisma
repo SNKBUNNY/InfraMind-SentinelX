@@ -1,0 +1,1161 @@
+// InfraMind-SentinelX — Production-Ready Autonomous SecOps + AIOps Platform
+// Complete schema: infrastructure + security + AI/RAG/agents + production additions
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================
+// MODULE 1: Multi-Tenant RBAC (PRODUCTION)
+// =====================================================
+
+model Organization {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  slug        String   @unique
+  plan        String   @default("enterprise") // "free" | "pro" | "enterprise"
+  status      String   @default("active")
+  settings    String   @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  users       User[]
+  hosts       Metric[]
+  events      SecurityEvent[]
+  incidents   Incident[]
+  backups     Backup[]
+  auditEvents AuditEvent[]
+  assets      Asset[]
+}
+
+model User {
+  id             String   @id @default(cuid())
+  email          String   @unique
+  name           String?
+  password       String
+  role           String   @default("viewer") // "super_admin" | "org_admin" | "security_analyst" | "infra_analyst" | "incident_responder" | "auditor" | "viewer"
+  orgId          String?
+  organization   Organization? @relation(fields: [orgId], references: [id])
+  permissions    String   @default("[]") // JSON array of permission strings
+  status         String   @default("active")
+  lastLoginAt    DateTime?
+  mfaEnabled     Boolean  @default(false)
+  apiKeys        String   @default("[]")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([orgId])
+  @@index([role])
+}
+
+// =====================================================
+// MODULE 2: Immutable Audit Trail (PRODUCTION — hash-chained)
+// =====================================================
+
+model AuditEvent {
+  id          String   @id @default(cuid())
+  orgId       String?
+  organization Organization? @relation(fields: [orgId], references: [id])
+  userId      String?
+  actor       String   // "user:admin@org.com" | "agent:investigation" | "system"
+  action      String   // "ISOLATE_HOST" | "CREATE_INCIDENT" | "EXECUTE_BACKUP" | "RUN_AGENT" | etc.
+  target      String   // what was acted upon (host:WIN-042, incident:INC-123, etc.)
+  reason      String?
+  threatScore Int?
+  policyName  String?  // which .psec policy authorized this
+  autonomyLevel Int?
+  approved    Boolean  @default(false)
+  approver    String?
+  result      String   // "SUCCESS" | "FAILURE" | "PENDING"
+  errorMessage String?
+  evidenceHash String? // SHA-256 of forensic evidence collected
+  metadata    String   @default("{}")
+  // Hash chain — each event includes the previous event's hash
+  prevHash    String?
+  hash        String   // SHA-256 of (prevHash + this event's fields)
+  sequence    Int      @default(0)
+  ts          DateTime @default(now())
+
+  @@index([orgId, ts])
+  @@index([actor, action])
+  @@index([target])
+  @@index([hash])
+}
+
+// =====================================================
+// MODULE 3: AI Gateway + Tool Registry (PRODUCTION)
+// =====================================================
+
+model Tool {
+  id          String   @id @default(cuid())
+  name        String   @unique // "isolate_host" | "quarantine_file" | "create_backup" | etc.
+  category    String   // "endpoint" | "infrastructure" | "database" | "investigation" | "backup" | "recovery" | "policy"
+  description String?
+  permissions String   @default("[]") // JSON array of permission strings required
+  minAutonomyLevel Int @default(2) // minimum autonomy level to execute
+  minThreatScore Int  @default(0) // minimum threat score required
+  requiresApproval Boolean @default(true)
+  parameters  String   @default("{}") // JSON schema for parameters
+  enabled     Boolean  @default(true)
+  executions  Int      @default(0)
+  lastExecutedAt DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([category, enabled])
+}
+
+model ToolExecution {
+  id          String   @id @default(cuid())
+  toolName    String
+  agentName   String?
+  userId      String?
+  parameters  String   @default("{}")
+  result      String   @default("{}")
+  status      String   @default("pending") // "pending" | "approved" | "executing" | "completed" | "failed" | "rejected"
+  approvedBy  String?
+  approvedAt  DateTime?
+  errorMessage String?
+  duration    Int?
+  auditEventId String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([toolName, status])
+  @@index([createdAt])
+}
+
+// =====================================================
+// MODULE 4: OCSF Unified Event Model (PRODUCTION)
+// =====================================================
+
+model UnifiedSecurityEvent {
+  id          String   @id @default(cuid())
+  orgId       String?
+  // OCSF core fields
+  eventId     String   @unique
+  timestamp   DateTime @default(now())
+  category    String   // "system" | "network" | "file" | "process" | "registry" | "usb" | "authentication" | "discovery"
+  activity    String   // specific activity (e.g., "process_create", "file_modify", "network_connect")
+  severity    String   @default("info") // "info" | "low" | "medium" | "high" | "critical"
+  // Normalized device/host info
+  deviceName  String?
+  deviceIp    String?
+  deviceOs    String?
+  // Normalized process info
+  processName String?
+  processPid  Int?
+  processCmdline String?
+  // Normalized user info
+  userName    String?
+  // Normalized network info
+  dstIp       String?
+  dstPort     Int?
+  srcIp       String?
+  srcPort     Int?
+  protocol    String?
+  // Normalized file info
+  filePath    String?
+  fileHash    String?
+  fileAction  String?
+  // Raw + metadata
+  rawData     String   @default("{}")
+  metadata    String   @default("{}")
+  // Source tracking
+  sourceType  String   // "linux_agent" | "windows_agent" | "docker" | "k8s" | "network_sensor" | "log"
+  sourceId    String?
+  // Processing status
+  isProcessed Boolean  @default(false)
+  threatScore Int      @default(0)
+  classification String @default("benign")
+  mitreAttackId String?
+  createdAt   DateTime @default(now())
+
+  @@index([orgId, timestamp])
+  @@index([category, activity])
+  @@index([severity, classification])
+  @@index([deviceName])
+}
+
+// =====================================================
+// MODULE 5: Infrastructure Telemetry
+// =====================================================
+
+model Metric {
+  id        String   @id @default(cuid())
+  orgId     String?
+  organization Organization? @relation(fields: [orgId], references: [id])
+  host      String
+  source    String   // "node" | "docker" | "k8s" | "windows" | "process"
+  metric    String   // "cpu" | "memory" | "memory_percent" | "disk" | "disk_io" | "network_rx" | "network_tx" | "load1" | "load5" | "processes"
+  value     Float
+  unit      String   @default("%")
+  tags      String   @default("{}")
+  ts        DateTime @default(now())
+
+  @@index([host, metric, ts])
+  @@index([ts])
+}
+
+model Forecast {
+  id          String   @id @default(cuid())
+  host        String
+  metric      String
+  model       String   // "lstm" | "prophet" | "linear" | "moving_avg"
+  ts          DateTime
+  value       Float
+  lower       Float
+  upper       Float
+  generatedAt DateTime @default(now())
+
+  @@index([host, metric, ts])
+}
+
+model Anomaly {
+  id        String   @id @default(cuid())
+  host      String
+  metric    String
+  ts        DateTime @default(now())
+  value     Float
+  expected  Float
+  score     Float
+  algorithm String   // "isolation_forest" | "dbscan" | "zscore" | "memory_leak"
+  severity  String   @default("warning")
+  resolved  Boolean  @default(false)
+  remediated Boolean  @default(false)
+  remediationAction String?
+  metadata  String   @default("{}")
+
+  @@index([host, metric, ts])
+  @@index([severity, resolved])
+}
+
+model LogEntry {
+  id         String   @id @default(cuid())
+  source     String
+  host       String
+  level      String
+  message    String
+  raw        String   @default("")
+  summary    String?
+  analyzedAt DateTime?
+  ts         DateTime @default(now())
+
+  @@index([source, level, ts])
+  @@index([host, ts])
+}
+
+model Container {
+  id            String   @id @default(cuid())
+  name          String   @unique
+  image         String
+  status        String   @default("running")
+  health        String   @default("healthy")
+  cpu           Float    @default(0)
+  memory        Float    @default(0)
+  memoryLimit   Float    @default(0)
+  restartCount  Int      @default(0)
+  createdAt     String?
+  startedAt     DateTime?
+  updatedAt     DateTime @updatedAt
+
+  @@index([status])
+}
+
+model K8sResource {
+  id        String   @id @default(cuid())
+  kind      String
+  namespace String   @default("default")
+  name      String
+  status    String   @default("Running")
+  ready     String   @default("1/1")
+  replicas  Int      @default(1)
+  cpu       Float    @default(0)
+  memory    Float    @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@index([kind, namespace])
+}
+
+// =====================================================
+// MODULE 6: Security Events & Threats (legacy, kept for compat)
+// =====================================================
+
+model SecurityEvent {
+  id             String   @id @default(cuid())
+  orgId          String?
+  organization   Organization? @relation(fields: [orgId], references: [id])
+  agentId        String
+  eventType      String
+  timestamp      DateTime @default(now())
+  rawData        String   @default("{}")
+  isProcessed    Boolean  @default(false)
+  threatScore    Int      @default(0)
+  classification String   @default("benign")
+  policyMatch    Boolean  @default(false)
+  policyAction    String?
+  agentName      String?
+  host           String?
+  unifiedEventId String?  // link to UnifiedSecurityEvent
+  threats        Threat[]
+
+  @@index([agentId, eventType, timestamp])
+  @@index([classification, threatScore])
+  @@index([timestamp])
+}
+
+model Threat {
+  id            String   @id @default(cuid())
+  eventId       String?  @unique
+  event         SecurityEvent? @relation(fields: [eventId], references: [id])
+  threatType    String
+  mitreAttackId String?
+  mitreTactic   String?
+  mitreTechnique String?
+  severity      String   @default("medium")
+  confidence    Float    @default(0.5)
+  indicators    String   @default("[]")
+  description   String?
+  recommendedAction String?
+  status        String   @default("open")
+  createdAt     DateTime @default(now())
+
+  @@index([threatType, severity])
+  @@index([status])
+}
+
+model ProcessInfo {
+  id          String   @id @default(cuid())
+  pid         Int
+  name        String
+  user        String?
+  cmdline     String?
+  cpuPercent  Float    @default(0)
+  memoryMB    Float    @default(0)
+  isSuspicious Boolean @default(false)
+  reason      String?
+  host        String
+  ts          DateTime @default(now())
+
+  @@index([host, name, ts])
+  @@index([isSuspicious])
+}
+
+model NetworkConnection {
+  id        String   @id @default(cuid())
+  pid       Int?
+  process   String?
+  dstIp     String
+  dstPort   Int
+  protocol  String   @default("tcp")
+  status    String
+  bytesSent Int      @default(0)
+  bytesRecv Int      @default(0)
+  host      String
+  ts        DateTime @default(now())
+
+  @@index([host, dstIp, ts])
+}
+
+model FileActivity {
+  id         String   @id @default(cuid())
+  action     String
+  filePath   String
+  fileName   String
+  extension  String
+  processName String?
+  host       String
+  ts         DateTime @default(now())
+
+  @@index([host, action, ts])
+}
+
+model RegistryChange {
+  id        String   @id @default(cuid())
+  hive      String
+  key       String
+  value     String?
+  data      String?
+  action    String
+  host      String
+  ts        DateTime @default(now())
+
+  @@index([host, key, ts])
+}
+
+model USBDevice {
+  id        String   @id @default(cuid())
+  device    String
+  action    String
+  host      String
+  ts        DateTime @default(now())
+
+  @@index([host, action, ts])
+}
+
+// =====================================================
+// MODULE 7: Incidents & Root Cause
+// =====================================================
+
+model Incident {
+  id             String   @id @default(cuid())
+  orgId          String?
+  organization   Organization? @relation(fields: [orgId], references: [id])
+  severity       String
+  status         String   @default("open")
+  type           String   @default("infrastructure")
+  affected       String
+  reason         String
+  recommendation String?
+  workNotes      String   @default("[]")
+  resolution     String?
+  relatedEventIds String  @default("[]")
+  rootCauseId    String?  @unique
+  rootCause      RootCause?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  resolvedAt     DateTime?
+
+  @@index([severity, status])
+  @@index([type, createdAt])
+  @@index([createdAt])
+}
+
+model RootCause {
+  id            String   @id @default(cuid())
+  incidentId    String?  @unique
+  incident      Incident? @relation(fields: [incidentId], references: [id])
+  host          String
+  metric        String
+  cause         String
+  confidence    Float
+  evidence      String   @default("[]")
+  resolution    String?
+  createdAt     DateTime @default(now())
+
+  @@index([host, createdAt])
+}
+
+// =====================================================
+// MODULE 8: Health, Risk, Recommendations
+// =====================================================
+
+model HealthScore {
+  id        String   @id @default(cuid())
+  host      String
+  score     Float
+  cpu       Float
+  memory    Float
+  disk      Float
+  logs      Float
+  incidents Float
+  forecast  Float
+  ts        DateTime @default(now())
+
+  @@index([host, ts])
+}
+
+model RiskScore {
+  id           String   @id @default(cuid())
+  host         String
+  probability  Float
+  level        String
+  factors      String   @default("{}")
+  ts           DateTime @default(now())
+
+  @@index([host, ts])
+}
+
+model RiskHierarchy {
+  id          String   @id @default(cuid())
+  scope       String
+  targetId    String?
+  targetName  String?
+  score       Float
+  level       String
+  factors     String   @default("{}")
+  trend       String   @default("stable")
+  predictedScore Float?
+  ts          DateTime @default(now())
+
+  @@index([scope, ts])
+  @@index([targetId, ts])
+}
+
+model Recommendation {
+  id          String   @id @default(cuid())
+  host        String
+  category    String
+  priority    String
+  title       String
+  description String
+  action      String
+  applied     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([priority, applied])
+}
+
+// =====================================================
+// MODULE 9: Policy Compiler
+// =====================================================
+
+model Policy {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  source    String
+  ast       String   @default("{}")
+  bytecode  String   @default("[]")
+  action    String
+  enabled   Boolean  @default(true)
+  category  String   @default("custom")
+  description String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([enabled, category])
+}
+
+// =====================================================
+// MODULE 10: AI / LLM / ChatOps
+// =====================================================
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  role      String
+  content   String
+  metadata  String   @default("{}")
+  context   String?
+  tokens    Int      @default(0)
+  model     String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+model AIAnalysis {
+  id          String   @id @default(cuid())
+  type        String
+  targetId    String?
+  targetKind  String?
+  summary     String
+  reasoning   String
+  confidence  Float
+  recommendations String @default("[]")
+  model       String?
+  createdAt   DateTime @default(now())
+
+  @@index([type, targetId])
+  @@index([createdAt])
+}
+
+// =====================================================
+// MODULE 11: RAG
+// =====================================================
+
+model KnowledgeDocument {
+  id         String   @id @default(cuid())
+  source     String
+  title      String
+  content    String
+  url        String?
+  category   String?
+  tags       String   @default("[]")
+  trustScore Float    @default(0.8) // PRODUCTION: trust scoring for RAG poisoning prevention
+  chunkCount Int      @default(0)
+  chunks     KnowledgeChunk[]
+  embedded   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([source, category])
+}
+
+model KnowledgeChunk {
+  id         String   @id @default(cuid())
+  documentId String
+  document   KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  content    String
+  chunkIndex Int
+  vector     String   @default("[]")
+  tokenCount Int      @default(0)
+  metadata   String   @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@index([documentId])
+  @@index([chunkIndex])
+}
+
+model RetrievalLog {
+  id        String   @id @default(cuid())
+  query     String
+  resultsCount Int
+  topScore  Float
+  retrievedChunks String @default("[]")
+  reranked  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// =====================================================
+// MODULE 12: Agentic AI
+// =====================================================
+
+model Agent {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  type        String
+  description String?
+  status      String   @default("idle")
+  capabilities String  @default("[]")
+  lastRunAt   DateTime?
+  config      String   @default("{}")
+  tasks       AgentTask[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([type, status])
+}
+
+model AgentTask {
+  id          String   @id @default(cuid())
+  agentId     String
+  agent       Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  status      String   @default("pending")
+  input       String   @default("{}")
+  output      String   @default("{}")
+  steps       String   @default("[]")
+  toolsUsed   String   @default("[]")
+  reasoning   String?
+  error       String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  duration    Int?
+  createdAt   DateTime @default(now())
+
+  @@index([agentId, status])
+  @@index([createdAt])
+}
+
+model AgentMemory {
+  id          String   @id @default(cuid())
+  agentId     String?
+  agentName   String?
+  memoryType  String
+  key         String
+  value       String
+  relevance   Float    @default(1)
+  accessCount Int      @default(0)
+  expiresAt   DateTime?
+  incidentId  String?
+  tags        String   @default("[]")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  lastAccessedAt DateTime?
+
+  @@index([agentId, memoryType])
+  @@index([key])
+}
+
+// =====================================================
+// MODULE 13: Orchestration & Workflows
+// =====================================================
+
+model Workflow {
+  id          String   @id @default(cuid())
+  name        String
+  type        String
+  status      String   @default("pending")
+  trigger     String   @default("{}")
+  steps       String   @default("[]")
+  results     String   @default("{}")
+  incidentId  String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  duration    Int?
+  createdAt   DateTime @default(now())
+  stepsRelation WorkflowStep[]
+
+  @@index([type, status])
+  @@index([createdAt])
+}
+
+model WorkflowStep {
+  id          String   @id @default(cuid())
+  workflowId  String
+  workflow    Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  stepIndex   Int
+  name        String
+  agentType   String?
+  status      String   @default("pending")
+  input       String   @default("{}")
+  output      String   @default("{}")
+  toolCalls   String   @default("[]")
+  startedAt   DateTime?
+  completedAt DateTime?
+  duration    Int?
+  error       String?
+
+  @@index([workflowId, stepIndex])
+}
+
+// =====================================================
+// MODULE 14: Knowledge Graph / Digital Twin
+// =====================================================
+
+model GraphNode {
+  id          String   @id @default(cuid())
+  nodeType    String
+  name        String
+  externalId  String?
+  host        String?
+  properties  String   @default("{}")
+  riskScore   Float    @default(0)
+  status      String   @default("active")
+  lastSeenAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  edgesFrom   GraphEdge[] @relation("GraphEdgeFrom")
+  edgesTo     GraphEdge[] @relation("GraphEdgeTo")
+
+  @@index([nodeType])
+  @@index([host])
+  @@index([name])
+}
+
+model GraphEdge {
+  id          String   @id @default(cuid())
+  fromId      String
+  toId        String
+  from        GraphNode @relation("GraphEdgeFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to          GraphNode @relation("GraphEdgeTo", fields: [toId], references: [id], onDelete: Cascade)
+  edgeType    String
+  properties  String   @default("{}")
+  weight      Float    @default(1)
+  createdAt   DateTime @default(now())
+
+  @@index([fromId, edgeType])
+  @@index([toId, edgeType])
+}
+
+// =====================================================
+// MODULE 15: Attack Path Analysis
+// =====================================================
+
+model AttackPath {
+  id            String   @id @default(cuid())
+  host          String
+  attackerProfile String  @default("{}")
+  techniques    String   @default("[]")
+  timeline      String   @default("[]")
+  killChainProgress String @default("execution")
+  severity      String   @default("medium")
+  confidence    Float    @default(0.5)
+  status        String   @default("active")
+  incidentId    String?
+  mitreTactics String   @default("[]")
+  duration      Int      @default(0)
+  evidenceCount Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([host, status])
+  @@index([severity])
+}
+
+// =====================================================
+// MODULE 16: Predictive Security
+// =====================================================
+
+model SecurityPrediction {
+  id              String   @id @default(cuid())
+  predictionType  String
+  targetHost      String?
+  probability     Float
+  confidence      Float
+  predictedAt     DateTime
+  horizon         String
+  features        String   @default("{}")
+  rationale       String?
+  modelVersion    String   @default("v1")
+  createdAt       DateTime @default(now())
+
+  @@index([predictionType, probability])
+  @@index([targetHost, predictedAt])
+}
+
+// =====================================================
+// MODULE 17: What-If Simulation
+// =====================================================
+
+model SimulationResult {
+  id              String   @id @default(cuid())
+  simulationType  String
+  targetId        String
+  targetName      String
+  predictedImpact String   @default("{}")
+  affectedCount   Int      @default(0)
+  riskReduction   Float    @default(0)
+  businessImpact  String   @default("low")
+  recoveryRequired Boolean  @default(false)
+  recommendation  String?
+  approvedBy      String?
+  executedAt      DateTime?
+  createdAt       DateTime @default(now())
+
+  @@index([simulationType, createdAt])
+  @@index([targetId])
+}
+
+// =====================================================
+// MODULE 18: AI Evaluation
+// =====================================================
+
+model EvaluationMetric {
+  id          String   @id @default(cuid())
+  metric      String
+  category    String
+  value       Float
+  sampleSize  Int      @default(0)
+  target      String?
+  metadata    String   @default("{}")
+  ts          DateTime @default(now())
+
+  @@index([metric, ts])
+  @@index([category])
+}
+
+// =====================================================
+// MODULE 19: Autonomy Levels
+// =====================================================
+
+model AutonomyPolicy {
+  id           String   @id @default(cuid())
+  name         String   @unique
+  description  String?
+  level        Int      @default(2)
+  threatScoreThresholds String @default("{}")
+  enabledActions String @default("[]")
+  blockedActions String @default("[]")
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([level, enabled])
+}
+
+// =====================================================
+// MODULE 20: Explainable AI
+// =====================================================
+
+model ThreatExplanation {
+  id          String   @id @default(cuid())
+  targetId    String
+  targetKind  String   @default("event")
+  threatScore Int
+  contributors String  @default("[]")
+  reasoning   String
+  modelVersion String   @default("rule-engine-v1")
+  createdAt   DateTime @default(now())
+
+  @@index([targetId])
+}
+
+// =====================================================
+// MODULE 21: Adversarial AI Tests
+// =====================================================
+
+model AdversarialTest {
+  id              String   @id @default(cuid())
+  testType        String
+  input           String
+  target          String
+  expectedBehavior String
+  actualBehavior  String?
+  blocked         Boolean  @default(false)
+  detected        Boolean  @default(false)
+  severity        String   @default("medium")
+  mitigationApplied String?
+  metadata        String   @default("{}")
+  createdAt       DateTime @default(now())
+
+  @@index([testType, blocked])
+  @@index([severity])
+}
+
+// =====================================================
+// MODULE 22: Forensic Evidence
+// =====================================================
+
+model ForensicEvidence {
+  id          String   @id @default(cuid())
+  incidentId  String?
+  evidenceType String
+  host        String?
+  content     String
+  hash        String
+  collectedAt DateTime @default(now())
+  collectedBy String   @default("evidence-collector-agent")
+  verified    Boolean  @default(false)
+  metadata    String   @default("{}")
+
+  @@index([incidentId])
+  @@index([evidenceType, collectedAt])
+}
+
+// =====================================================
+// MODULE 23: Threat Hunting
+// =====================================================
+
+model ThreatHunt {
+  id           String   @id @default(cuid())
+  hypothesis   String
+  rationale    String
+  status       String   @default("pending")
+  findings     String   @default("{}")
+  toolsUsed    String   @default("[]")
+  evidence     String   @default("[]")
+  confidence   Float    @default(0)
+  triggeredBy  String   @default("proactive")
+  relatedIncidentId String?
+  relatedHost  String?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  duration     Int?
+  createdAt    DateTime @default(now())
+
+  @@index([status, createdAt])
+  @@index([triggeredBy])
+}
+
+// =====================================================
+// MODULE 24: Backup & Recovery with RPO/RTO (PRODUCTION)
+// =====================================================
+
+model Backup {
+  id             String   @id @default(cuid())
+  orgId          String?
+  organization   Organization? @relation(fields: [orgId], references: [id])
+  sourcePath     String
+  backupFilePath String?
+  fileCount      Int      @default(0)
+  status         String   @default("pending")
+  integrityHash  String?
+  encryptionAlgo String   @default("aes-256-gcm")
+  sizeBytes      Int      @default(0)
+  triggeredBy    String   @default("manual")
+  policyId       String?
+  incidentId     String?
+  // PRODUCTION: Immutability + RPO/RTO
+  immutable      Boolean  @default(true) // backup cannot be deleted/modified after creation
+  version        Int      @default(1)
+  retentionDays  Int      @default(30)
+  expiresAt      DateTime?
+  rpoMinutes     Int      @default(15) // Recovery Point Objective
+  rtoMinutes     Int      @default(5)  // Recovery Time Objective
+  verified       Boolean  @default(false)
+  verifiedAt     DateTime?
+  createdAt      DateTime @default(now())
+  completedAt    DateTime?
+
+  @@index([status, createdAt])
+  @@index([triggeredBy])
+  @@index([immutable])
+}
+
+model QuarantineItem {
+  id          String   @id @default(cuid())
+  filePath    String
+  originalPath String
+  fileName    String
+  fileHash    String?
+  fileSize    Int      @default(0)
+  reason      String
+  agentId     String?
+  host        String?
+  encrypted   Boolean  @default(true)
+  status      String   @default("quarantined")
+  createdAt   DateTime @default(now())
+
+  @@index([status, createdAt])
+}
+
+// =====================================================
+// MODULE 25: Asset + Vulnerability Management (PRODUCTION)
+// =====================================================
+
+model Asset {
+  id              String   @id @default(cuid())
+  orgId           String?
+  organization    Organization? @relation(fields: [orgId], references: [id])
+  assetType       String   // "host" | "container" | "k8s_pod" | "k8s_node" | "service"
+  name            String
+  hostname        String?
+  ipAddress       String?
+  os              String?
+  osVersion       String?
+  status          String   @default("active") // "active" | "inactive" | "decommissioned"
+  internetFacing  Boolean  @default(false)
+  exposedPorts    String   @default("[]")
+  installedSoftware String @default("[]") // JSON array of {name, version}
+  criticality     String   @default("medium") // "low" | "medium" | "high" | "critical"
+  riskScore       Float    @default(0)
+  lastScannedAt   DateTime?
+  vulnerabilities Vulnerability[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([orgId, assetType])
+  @@index([status])
+  @@index([internetFacing])
+  @@index([riskScore])
+}
+
+model Vulnerability {
+  id              String   @id @default(cuid())
+  assetId         String
+  asset           Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  cveId           String   // "CVE-2024-1234"
+  severity        String   // "low" | "medium" | "high" | "critical"
+  cvssScore       Float
+  title           String
+  description     String?
+  affectedSoftware String
+  affectedVersion String
+  fixedVersion    String?
+  exploitAvailable Boolean  @default(false)
+  patched         Boolean  @default(false)
+  patchedAt       DateTime?
+  discoveredAt    DateTime @default(now())
+
+  @@index([assetId, severity])
+  @@index([cveId])
+  @@index([patched])
+}
+
+// =====================================================
+// MODULE 26: NIST CSF Posture (PRODUCTION)
+// =====================================================
+
+model NistCsfScore {
+  id          String   @id @default(cuid())
+  function    String   // "govern" | "identify" | "protect" | "detect" | "respond" | "recover"
+  category    String?
+  score       Float    // 0-100
+  details     String   @default("{}")
+  ts          DateTime @default(now())
+
+  @@index([function, ts])
+}
+
+// =====================================================
+// MODULE 27: Platform Observability / SLOs (PRODUCTION)
+// =====================================================
+
+model PlatformMetric {
+  id          String   @id @default(cuid())
+  metric      String   // "api_latency_ms" | "event_processing_rate" | "rag_latency_ms" | "llm_latency_ms" | "agent_duration_ms" | "error_rate" | "db_latency_ms"
+  value       Float
+  unit        String   @default("ms")
+  endpoint    String?
+  metadata    String   @default("{}")
+  ts          DateTime @default(now())
+
+  @@index([metric, ts])
+}
+
+model SLO {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  target      Float    // e.g., 99.9
+  current     Float    @default(0)
+  unit        String   @default("%")
+  status      String   @default("meeting") // "meeting" | "at_risk" | "breaching"
+  window      String   @default("30d")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+}
+
+// =====================================================
+// MODULE 28: Integrations (SIEM/SOAR/ITSM) (PRODUCTION)
+// =====================================================
+
+model Integration {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  type        String   // "splunk" | "elastic" | "syslog" | "slack" | "email" | "jira" | "webhook" | "teams"
+  category    String   // "siem" | "soar" | "itsm" | "notification"
+  config      String   @default("{}") // JSON: endpoint, auth, etc.
+  enabled     Boolean  @default(true)
+  lastSentAt  DateTime?
+  eventsSent  Int      @default(0)
+  eventsFailed Int     @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([type, enabled])
+  @@index([category])
+}
+
+model OutboundEvent {
+  id          String   @id @default(cuid())
+  integrationId String?
+  integrationName String
+  eventType   String   // "security_event" | "incident" | "threat" | "alert"
+  payload     String   @default("{}")
+  status      String   @default("pending") // "pending" | "sent" | "failed"
+  response    String?
+  attempts    Int      @default(0)
+  sentAt      DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([integrationName, status])
+  @@index([createdAt])
+}
+
+// =====================================================
+// MODULE 29: Agent Endpoints & Reports
+// =====================================================
+
+model AgentEndpoint {
+  id          String   @id @default(cuid())
+  agentId     String   @unique
+  hostname    String
+  os          String
+  ip          String?
+  status      String   @default("offline")
+  lastSeenAt  DateTime?
+  version     String?
+  capabilities String  @default("[]")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+}
+
+model Report {
+  id          String   @id @default(cuid())
+  type        String
+  title       String
+  format      String   @default("json")
+  content     String   @default("{}")
+  summary     String?
+  generatedBy String   @default("system")
+  createdAt   DateTime @default(now())
+
+  @@index([type, createdAt])
+}
+
+model Setting {
+  id    String @id @default(cuid())
+  key   String @unique
+  value String
+}
